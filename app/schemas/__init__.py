@@ -57,3 +57,5 @@ class TransferIn(BaseModel):
     price: float | None = None
     tx_date: str = ""
     remark: str = ""
+    # 客户端幂等键：双击/网络重试携带同一 request_id 时只成交一次
+    request_id: str | None = Field(default=None, max_length=64)

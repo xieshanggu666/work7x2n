@@ -8,6 +8,12 @@ views.QuotaView = () => {
   const [selYear, setSelYear] = React.useState(2025);
   const [form, setForm] = React.useState({ company_id: "", year: 2025, baseline: "", allocation_amount: "", adjustment: "" });
   const [txForm, setTxForm] = React.useState({ amount: "", tx_type: "sell", counterparty: "", price: "", tx_date: "", remark: "" });
+  // 每次交易生成一个幂等键，随请求上送；成交后换新键，双击/重试只成交一次
+  const newTxKey = () =>
+    (window.crypto && window.crypto.randomUUID)
+      ? window.crypto.randomUUID()
+      : `tx-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const [txKey, setTxKey] = React.useState(newTxKey());
   const [msg, setMsg] = React.useState({ type: "", text: "" });
 
   const isAdmin = window.__user.role === "admin";
@@ -66,9 +72,11 @@ views.QuotaView = () => {
         price: txForm.price ? Number(txForm.price) : null,
         tx_date: txForm.tx_date,
         remark: txForm.remark,
+        request_id: txKey,
       });
       setMsg({ type: "ok", text: `交易成功：${txLabel[r.tx_type]} ${fmtNum(r.amount)} 吨，余额 ${fmtNum(r.balance_after)}` });
       setTxForm({ amount: "", tx_type: "sell", counterparty: "", price: "", tx_date: "", remark: "" });
+      setTxKey(newTxKey());  // 已成交，后续提交使用新幂等键
       loadAccount();
     } catch (err) {
       setMsg({ type: "err", text: err.message });

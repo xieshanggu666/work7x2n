@@ -1,11 +1,21 @@
-"""配额交易台账：买入/卖出/划转，带余额校验。"""
+"""配额交易台账：买入/卖出/划转。
+
+并发安全由 :mod:`app.services.ledger` 统一保证：
+账户锁定（SQLite BEGIN IMMEDIATE / 其他库 FOR UPDATE）→
+余额条件原子扣减 → 幂等流水 → 统一提交/回滚。
+"""
 
 from sqlalchemy.orm import Session
 
 from app.models.allowance import AllowanceAccount, AllowanceTransaction
-
-_INCREASE_TYPES = {"allocation", "buy", "transfer_in"}
-_DECREASE_TYPES = {"sell", "transfer_out", "offset", "clear"}
+from app.services.ledger import (
+    ALL_TX_TYPES,
+    apply_balance_change,
+    find_idempotent_tx,
+    ledger_transaction,
+    lock_accounts,
+    write_ledger,
+)
 
 
 def transfer(
@@ -17,32 +27,37 @@ def transfer(
     price: float | None = None,
     tx_date: str = "",
     remark: str = "",
+    request_id: str | None = None,
 ) -> AllowanceTransaction:
-    """在配额账户上划转配额，校验可用余额充足后写流水。"""
-    if amount <= 0:
-        raise ValueError("划转数量必须为正数")
-    if tx_type not in _INCREASE_TYPES | _DECREASE_TYPES:
+    """在配额账户上划转配额。
+
+    - 重复提交：同一 ``request_id`` 直接返回首笔流水，余额不二次变动；
+    - 余额不足：原子条件更新失败，抛 ``InsufficientBalanceError`` 并整体回滚；
+    - 余额快照与流水同事务写入，保证账实一致。
+    """
+    if tx_type not in ALL_TX_TYPES:
         raise ValueError(f"不支持的交易类型: {tx_type}")
 
-    balance = float(account.current_balance)
-    if tx_type in _DECREASE_TYPES and balance < amount:
-        raise ValueError("配额余额不足")
+    # 幂等检查与账户锁定必须在同一写事务内
+    with ledger_transaction(db):
+        lock_accounts(db, [account])
+        existing = find_idempotent_tx(db, account.id, request_id)
+        if existing is not None:
+            db.refresh(existing)
+            return existing
 
-    balance_after = balance + amount if tx_type in _INCREASE_TYPES else balance - amount
-    account.current_balance = round(balance_after, 4)
-
-    tx = AllowanceTransaction(
-        account_id=account.id,
-        company_id=account.company_id,
-        tx_type=tx_type,
-        amount=round(amount, 4),
-        counterparty=counterparty,
-        price=round(price, 2) if price is not None else None,
-        tx_date=tx_date,
-        balance_after=round(balance_after, 4),
-        remark=remark,
-    )
-    db.add(tx)
-    db.commit()
-    db.refresh(tx)
-    return tx
+        balance_after = apply_balance_change(db, account, tx_type, amount)
+        tx = write_ledger(
+            db,
+            account,
+            tx_type,
+            amount,
+            balance_after,
+            counterparty=counterparty,
+            price=price,
+            tx_date=tx_date,
+            remark=remark,
+            request_id=request_id,
+        )
+        db.refresh(tx)
+        return tx

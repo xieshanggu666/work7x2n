@@ -1,14 +1,32 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import ensure_company_access, get_current_user, require_roles
 from app.models import AllowanceAccount, AllowanceTransaction, ComplianceRecord, Quota, User
 from app.schemas import QuotaIn, TransferIn
+from app.services.ledger import InsufficientBalanceError
 from app.services.quota_service import allocate_quota, clear_emission
 from app.services.trading_service import transfer
 
 router = APIRouter(prefix="/api", tags=["quotas"])
+
+
+def _raise_ledger_error(exc: Exception) -> None:
+    """台账写操作异常到 HTTP 响应的统一映射。
+
+    - 业务校验失败（余额不足等）→ 400；
+    - 唯一约束冲突（并发重复分配/履约）→ 409；
+    - SQLite 写锁等待超时（并发竞争）→ 409，提示客户端稍后重试。
+    """
+    if isinstance(exc, InsufficientBalanceError):
+        raise HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, IntegrityError):
+        raise HTTPException(status_code=409, detail="该业务已存在处理记录，请勿重复提交")
+    if isinstance(exc, OperationalError) and "locked" in str(exc.orig).lower():
+        raise HTTPException(status_code=409, detail="账户正被其他操作占用，请稍后重试")
+    raise exc
 
 
 @router.get("/quotas")
@@ -36,7 +54,10 @@ def list_quotas(year: int | None = None, db: Session = Depends(get_db), user: Us
 
 @router.post("/quotas")
 def create_quota(data: QuotaIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
-    quota = allocate_quota(db, data.company_id, data.year, data.baseline, data.allocation_amount, data.adjustment)
+    try:
+        quota = allocate_quota(db, data.company_id, data.year, data.baseline, data.allocation_amount, data.adjustment)
+    except Exception as exc:  # 统一台账异常映射
+        _raise_ledger_error(exc)
     return {"id": quota.id, "company_id": quota.company_id, "total": float(quota.total), "status": quota.status}
 
 
@@ -67,10 +88,26 @@ def do_transfer(account_id: int, data: TransferIn, db: Session = Depends(get_db)
         raise HTTPException(status_code=404, detail="配额账户不存在")
     ensure_company_access(user, account.company_id, "无权操作该账户")
     try:
-        tx = transfer(db, account, data.amount, data.tx_type, data.counterparty, data.price, data.tx_date, data.remark)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"id": tx.id, "tx_type": tx.tx_type, "amount": float(tx.amount), "balance_after": float(tx.balance_after)}
+        tx = transfer(
+            db,
+            account,
+            data.amount,
+            data.tx_type,
+            data.counterparty,
+            data.price,
+            data.tx_date,
+            data.remark,
+            request_id=data.request_id,
+        )
+    except Exception as exc:  # 余额不足/重复提交/锁竞争统一映射
+        _raise_ledger_error(exc)
+    return {
+        "id": tx.id,
+        "tx_type": tx.tx_type,
+        "amount": float(tx.amount),
+        "balance_after": float(tx.balance_after),
+        "request_id": tx.request_id,
+    }
 
 
 @router.get("/accounts/{account_id}/transactions")
@@ -130,7 +167,11 @@ def list_compliance(year: int | None = None, db: Session = Depends(get_db), user
 
 @router.post("/companies/{company_id}/clear")
 def do_clear(company_id: int, year: int, deadline: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
-    record = clear_emission(db, company_id, year, deadline)
+    try:
+        # 重复清缴按 (企业, 年度) 幂等：已完成的履约直接返回原记录，不重复扣配额
+        record = clear_emission(db, company_id, year, deadline)
+    except Exception as exc:
+        _raise_ledger_error(exc)
     return {
         "id": record.id,
         "status": record.status,
