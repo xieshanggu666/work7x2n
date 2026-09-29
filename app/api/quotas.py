@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -61,13 +61,25 @@ def company_account(company_id: int, year: int, db: Session = Depends(get_db), u
 
 
 @router.post("/accounts/{account_id}/transfer")
-def do_transfer(account_id: int, data: TransferIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "enterprise"))):
+def do_transfer(request: Request, account_id: int, data: TransferIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "enterprise"))):
     account = db.get(AllowanceAccount, account_id)
     if not account:
         raise HTTPException(status_code=404, detail="配额账户不存在")
     ensure_company_access(user, account.company_id, "无权操作该账户")
+    # 幂等键优先取请求体字段，其次取 Idempotency-Key 请求头（双击/超时重试不重复入账）
+    idem_key = data.idempotency_key or request.headers.get("idempotency-key")
     try:
-        tx = transfer(db, account, data.amount, data.tx_type, data.counterparty, data.price, data.tx_date, data.remark)
+        tx = transfer(
+            db,
+            account,
+            data.amount,
+            data.tx_type,
+            data.counterparty,
+            data.price,
+            data.tx_date,
+            data.remark,
+            idempotency_key=idem_key,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"id": tx.id, "tx_type": tx.tx_type, "amount": float(tx.amount), "balance_after": float(tx.balance_after)}
@@ -129,8 +141,21 @@ def list_compliance(year: int | None = None, db: Session = Depends(get_db), user
 
 
 @router.post("/companies/{company_id}/clear")
-def do_clear(company_id: int, year: int, deadline: str, db: Session = Depends(get_db), user: User = Depends(require_roles("admin"))):
-    record = clear_emission(db, company_id, year, deadline)
+def do_clear(
+    request: Request,
+    company_id: int,
+    year: int,
+    deadline: str,
+    idempotency_key: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("admin")),
+):
+    # 幂等键优先取查询参数，其次取 Idempotency-Key 请求头；重复清缴请求返回首次结果
+    idem_key = idempotency_key or request.headers.get("idempotency-key")
+    try:
+        record = clear_emission(db, company_id, year, deadline, idempotency_key=idem_key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {
         "id": record.id,
         "status": record.status,

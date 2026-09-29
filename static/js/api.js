@@ -1,8 +1,16 @@
 const api = {
-  async request(method, url, body) {
+  // 生成客户端幂等键：同一次提交在双击/重试/超时重发时只生效一次
+  idemKey() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return "idem-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+  },
+  async request(method, url, body, idemKey) {
+    const headers = { "Content-Type": "application/json" };
+    // 写操作携带幂等键，服务端据此去重，避免重复扣减/重复履约
+    if (idemKey) headers["Idempotency-Key"] = idemKey;
     const res = await fetch(url, {
       method,
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: body ? JSON.stringify(body) : undefined,
       credentials: "same-origin",
     });
@@ -17,7 +25,7 @@ const api = {
     return res.json();
   },
   get(url) { return this.request("GET", url); },
-  post(url, body) { return this.request("POST", url, body); },
+  post(url, body, idemKey) { return this.request("POST", url, body, idemKey); },
   put(url, body) { return this.request("PUT", url, body); },
 };
 

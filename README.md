@@ -6,15 +6,17 @@
 
 - **后端**：Python 3.10+ / FastAPI / SQLAlchemy ORM / SQLite / JWT（Cookie 认证）
 - **前端**：React 18（本地 UMD 运行时 + htm 模板引擎，无需构建工具，完全离线可用）
-- **测试**：pytest（19 项全部通过）
+- **测试**：pytest（40 项全部通过，含 12 项多线程并发一致性测试）
 
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
-python scripts/init_db.py      # 初始化数据库与演示数据
+python scripts/init_db.py      # 初始化数据库与演示数据（已有旧库先执行迁移脚本）
 uvicorn app.main:app --reload  # 启动服务
 ```
+
+> 升级旧库（新增幂等键列与唯一约束）：`python scripts/migrate_concurrency.py`，可重复执行。
 
 访问 http://127.0.0.1:8000
 
@@ -38,8 +40,15 @@ uvicorn app.main:app --reload  # 启动服务
    - 因子按年度生效区间取值，重复核算幂等（先清后算）
 5. **配额管理**：免费配额分配（基准 + 分配量 + 调整量）、配额账户余额
 6. **配额交易台账**：买入/卖出/划转，实时校验可用余额，逐笔记录余额快照
-7. **履约清缴**：按核查排放量划转配额，配额不足自动记为缺口（deficit）
+7. **履约清缴**：按核查排放量划转配额，配额不足自动记为缺口（deficit）；已达标重复清缴自动幂等，缺口年度可按剩余缺口补缴
 8. **MRV 报告**：年度范围一二三汇总生成，草稿 → 提交 → 批准状态流转
+
+### 并发一致性保障（清缴 / 交易）
+
+- **账户锁定**：进程内按键（账户 / 企业+年度清缴）串行化余额变更，多键按序加锁防死锁；PostgreSQL/MySQL 额外加 `SELECT … FOR UPDATE` 行锁，SQLite 设置 `busy_timeout` 等待写锁
+- **原子扣减**：扣减使用 `current_balance >= amount` 条件单条 UPDATE，由数据库保证不会超额扣减；余额与流水在同一事务提交，异常统一回滚
+- **重复提交**：流水与履约记录支持幂等键（请求体 `idempotency_key` 或 `Idempotency-Key` 请求头），双击 / 超时重试只入账一次；前端提交期间禁用按钮并自动生成幂等键
+- **数据库兜底约束**：`quotas` / `compliance_records` 的 (企业, 年度) 唯一约束防止并发分配/清缴产生重复主记录
 
 ## 数据表（12 张）
 
@@ -70,7 +79,7 @@ uvicorn app.main:app --reload  # 启动服务
 ## 测试
 
 ```bash
-python -m pytest tests/ -v   # 19 passed
+python -m pytest tests/ -v   # 40 passed
 ```
 
-覆盖：核算引擎两种公式、因子按年取值、核算幂等、配额分配幂等、清缴达标/缺口、交易余额校验、MRV 状态机与 API 冒烟。
+覆盖：核算引擎两种公式、因子按年取值、核算幂等、配额分配幂等、清缴达标/缺口与补缴、交易余额校验、MRV 状态机、API 冒烟、越权防护，以及多线程并发交易/清缴（无超额扣减、流水快照链一致、幂等键去重、失败整体回滚、清缴与交易并发三方一致）。

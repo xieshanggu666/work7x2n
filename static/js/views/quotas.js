@@ -9,6 +9,8 @@ views.QuotaView = () => {
   const [form, setForm] = React.useState({ company_id: "", year: 2025, baseline: "", allocation_amount: "", adjustment: "" });
   const [txForm, setTxForm] = React.useState({ amount: "", tx_type: "sell", counterparty: "", price: "", tx_date: "", remark: "" });
   const [msg, setMsg] = React.useState({ type: "", text: "" });
+  // 提交中状态：禁用按钮，防止双击造成重复提交（服务端另有幂等键兜底）
+  const [submitting, setSubmitting] = React.useState(false);
 
   const isAdmin = window.__user.role === "admin";
 
@@ -58,7 +60,10 @@ views.QuotaView = () => {
   const doTransfer = async (e) => {
     e.preventDefault();
     if (!account) { setMsg({ type: "err", text: "请先加载配额账户" }); return; }
+    if (submitting) return;
+    setSubmitting(true);
     try {
+      // 每次提交生成一个幂等键：双击/网络重试只入账一次
       const r = await api.post(`/api/accounts/${account.id}/transfer`, {
         amount: Number(txForm.amount),
         tx_type: txForm.tx_type,
@@ -66,19 +71,22 @@ views.QuotaView = () => {
         price: txForm.price ? Number(txForm.price) : null,
         tx_date: txForm.tx_date,
         remark: txForm.remark,
-      });
+      }, api.idemKey());
       setMsg({ type: "ok", text: `交易成功：${txLabel[r.tx_type]} ${fmtNum(r.amount)} 吨，余额 ${fmtNum(r.balance_after)}` });
       setTxForm({ amount: "", tx_type: "sell", counterparty: "", price: "", tx_date: "", remark: "" });
       loadAccount();
     } catch (err) {
       setMsg({ type: "err", text: err.message });
+    } finally {
+      setSubmitting(false);
     }
   };
 
   const doClear = async (c) => {
     if (!confirm(`确认对 ${c.name}（${c.year} 年）执行履约清缴？`)) return;
     try {
-      const r = await api.post(`/api/companies/${c.company_id}/clear?year=${c.year}&deadline=${c.year}-12-31`);
+      // 清缴幂等键：重复点击/超时重发返回同一履约记录，不重复扣减
+      const r = await api.post(`/api/companies/${c.company_id}/clear?year=${c.year}&deadline=${c.year}-12-31`, null, api.idemKey());
       setMsg({ type: "ok", text: `清缴完成：状态 ${r.status}，缺口 ${fmtNum(r.deficit)} 吨` });
       api.get("/api/compliance").then(setCompliance);
       loadAccount();
@@ -143,7 +151,7 @@ views.QuotaView = () => {
           <div class="field"><label>单价 (元/t)</label><input type="number" value=${txForm.price} onChange=${setTx("price")} /></div>
           <div class="field"><label>日期</label><input value=${txForm.tx_date} onChange=${setTx("tx_date")} placeholder="YYYY-MM-DD" /></div>
           <div class="field"><label>备注</label><input value=${txForm.remark} onChange=${setTx("remark")} /></div>
-          <div class="actions"><button class="btn" type="submit">提交交易</button></div>
+          <div class="actions"><button class="btn" type="submit" disabled=${submitting}>${submitting ? "提交中…" : "提交交易"}</button></div>
         </form>
         <table style=${{marginTop: "16px"}}>
           <thead><tr><th>ID</th><th>类型</th><th>数量 (t)</th><th>对手方</th><th>单价</th><th>日期</th><th>余额</th><th>备注</th></tr></thead>

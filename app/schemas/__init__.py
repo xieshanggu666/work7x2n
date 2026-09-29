@@ -57,3 +57,5 @@ class TransferIn(BaseModel):
     price: float | None = None
     tx_date: str = ""
     remark: str = ""
+    # 客户端幂等键：同账户相同键的重复提交只入账一次（也可用 Idempotency-Key 请求头）
+    idempotency_key: str | None = None
